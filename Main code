@@ -1,0 +1,1530 @@
+import os
+import tempfile
+from datetime import datetime, timedelta
+import json
+import uuid
+import csv
+import io
+import re
+
+# To Build UI
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+
+# --- NEW: OCR Imports ---
+try:
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    from PIL import Image
+    import cv2  # For image pre-processing
+    import numpy as np  # For image pre-processing
+    OCR_ENABLED = True
+except ImportError:
+    OCR_ENABLED = False
+    st.error("OCR Libraries not found. Please run: pip install pytesseract pdf2image opencv-python-headless")
+
+# --- MODIFIED ---
+from langchain_ollama.embeddings import OllamaEmbeddings
+
+# Agno Agentic AI Library to Build AI Agents
+from agno.agent import Agent
+from agno.models.ollama import Ollama  # Reasoning
+
+# Agno VectorDB for RAG
+from agno.vectordb.chroma import ChromaDb  # RAG
+
+# Langchain for Document Parsing and RAG DB Buildng
+from langchain_community.document_loaders import PyMuPDFLoader  # For Finance Parser
+from langchain_community.document_loaders import PyPDFLoader  # For General RAG
+
+from langchain_text_splitters import (
+    RecursiveCharacterTextSplitter,
+)
+from langchain_core.documents import Document
+
+# --- Constants ---
+COLLECTION_NAME = "Local_RAG"
+CHATS_FOLDER = "./saved_chats"
+EXPENSES_FILE = "./expenses_tracker.json"
+EARNINGS_FILE = "./earnings_tracker.json"
+
+# Create chats folder if it doesn't exist
+os.makedirs(CHATS_FOLDER, exist_ok=True)
+
+# --- MODEL CONFIG ---
+# Using gemma3:4b for both reasoning and parsing
+# ollama pull gemma3:4b
+OLLAMA_EMBEDDING_MODEL = "nomic-embed-text"
+OLLAMA_REASONING_MODEL = "gemma3:4b"  # Upgraded for accurate RAG
+OLLAMA_PARSING_MODEL = "gemma3:4b"    # Capable model for parsing
+
+# --- Use OllamaEmbeddings ---
+try:
+    EMBEDDING_MODEL = OllamaEmbeddings(
+        model=OLLAMA_EMBEDDING_MODEL, 
+        base_url="http://localhost:11434"
+    )
+except Exception as e:
+    st.error(f"Failed to initialize Ollama embeddings. Is Ollama running? Error: {e}")
+    st.stop()
+
+
+# --- Custom CSS (Omitted for brevity) ---
+st.markdown("""
+<style>
+    /* ... [Your full CSS is here] ... */
+</style>
+""", unsafe_allow_html=True)
+
+# --- Streamlit App Initialization ---
+st.markdown("<h1>💬 Local AI Chat & Finance</h1>", unsafe_allow_html=True)
+st.markdown("<p style='text-align: center; color: #6c757d; font-size: 14px;'>Powered by Ollama</p>", unsafe_allow_html=True)
+
+
+# --- Transaction Functions (All Restored) ---
+def load_expenses():
+    if os.path.exists(EXPENSES_FILE):
+        try:
+            with open(EXPENSES_FILE, 'r') as f: return json.load(f)
+        except: return []
+    return []
+
+def save_expenses(expenses):
+    try:
+        with open(EXPENSES_FILE, 'w') as f: json.dump(expenses, f, indent=2)
+        return True
+    except: return False
+
+def add_expense(amount, category, description, date=None):
+    expenses = load_expenses()
+    if date is None: date = datetime.now().isoformat()
+    expense = {
+        'id': str(uuid.uuid4())[:8], 'amount': abs(float(amount)), 'category': category,
+        'description': description, 'date': date, 'timestamp': datetime.now().isoformat(),
+        'type': 'expense'
+    }
+    expenses.append(expense)
+    save_expenses(expenses)
+    return expense
+
+def delete_expense(expense_id):
+    expenses = load_expenses()
+    expenses = [e for e in expenses if e['id'] != expense_id]
+    save_expenses(expenses)
+    st.rerun()
+
+def load_earnings():
+    if os.path.exists(EARNINGS_FILE):
+        try:
+            with open(EARNINGS_FILE, 'r') as f: return json.load(f)
+        except: return []
+    return []
+
+def save_earnings(earnings):
+    try:
+        with open(EARNINGS_FILE, 'w') as f: json.dump(earnings, f, indent=2)
+        return True
+    except: return False
+
+def add_earning(amount, category, description, date=None):
+    earnings = load_earnings()
+    if date is None: date = datetime.now().isoformat()
+    earning = {
+        'id': str(uuid.uuid4())[:8], 'amount': abs(float(amount)), 'category': category,
+        'description': description, 'date': date, 'timestamp': datetime.now().isoformat(),
+        'type': 'earning'
+    }
+    earnings.append(earning)
+    save_earnings(earnings)
+    return earning
+
+def delete_earning(earning_id):
+    earnings = load_earnings()
+    earnings = [e for e in earnings if e['id'] != earning_id]
+    save_earnings(earnings)
+    st.rerun()
+
+def get_transactions_by_period(source_func, period='daily'):
+    transactions = source_func()
+    now = datetime.now()
+    filtered = []
+    for trans in transactions:
+        try:
+            trans_date = datetime.fromisoformat(trans['date'])
+        except (ValueError, TypeError):
+            continue
+            
+        if period == 'daily':
+            if trans_date.date() == now.date(): filtered.append(trans)
+        elif period == 'weekly':
+            start_of_week = now - timedelta(days=now.weekday())
+            if trans_date.date() >= start_of_week.date() and trans_date.date() <= now.date(): filtered.append(trans)
+        elif period == 'monthly':
+            if trans_date.month == now.month and trans_date.year == now.year: filtered.append(trans)
+    return filtered
+
+def get_expenses_by_category():
+    expenses = load_expenses()
+    by_category = {}
+    for expense in expenses:
+        category = expense.get('category', '💼 Other')
+        if category not in by_category: by_category[category] = []
+        by_category[category].append(expense)
+    return by_category
+
+def calculate_total(transactions):
+    return sum(abs(e.get('amount', 0)) for e in transactions)
+
+
+# --- OCR Pre-processing Helper ---
+def preprocess_image_for_ocr(image):
+    """ Pre-processes a PIL Image for better OCR results. """
+    try:
+        open_cv_image = np.array(image)
+        if len(open_cv_image.shape) == 3:
+            gray = cv2.cvtColor(open_cv_image, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = open_cv_image
+
+        processed_image = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        )
+        return Image.fromarray(processed_image)
+    except Exception as e:
+        st.warning(f"Failed to preprocess image for OCR: {e}. Using original image.")
+        return image
+
+
+# --- ##### NEW FIX (Fix 8): FINAL ROBUST BANK STATEMENT PARSER ##### ---
+def parse_bank_statement_pdf(uploaded_file):
+    """
+    Extract transactions from bank statement PDF, chunk by chunk for better accuracy.
+    Includes OCR fallback for scanned documents.
+    """
+    unique_transactions = {}
+    all_pages_as_documents = []
+    pdf_bytes = uploaded_file.read()
+    
+    # --- Step 1: Try Digital Extraction First ---
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(pdf_bytes)
+            tmp_file_path = tmp_file.name
+            
+        loader = PyMuPDFLoader(tmp_file_path)
+        pages = loader.load()
+        full_digital_text = "".join([page.page_content for page in pages]).strip()
+        
+        if len(full_digital_text) > 100 * len(pages): # Robust check
+            st.info("Digital PDF detected. Processing text directly.")
+            all_pages_as_documents = pages
+        else:
+            st.warning("Little or no digital text found. PDF appears to be scanned. Attempting OCR...")
+            all_pages_as_documents = [] # Force OCR
+            
+    except Exception as e:
+        st.warning(f"Digital PDF loading failed ({e}). Assuming scanned PDF and attempting OCR...")
+        all_pages_as_documents = []
+    finally:
+        if 'tmp_file_path' in locals() and os.path.exists(tmp_file_path):
+            os.unlink(tmp_file_path)
+
+    # --- Step 2: Fallback to OCR if digital extraction failed ---
+    if not all_pages_as_documents:
+        if not OCR_ENABLED:
+            st.error("Scanned PDF detected, but OCR libraries are not installed.")
+            return []
+        try:
+            images = convert_from_bytes(pdf_bytes)
+            ocr_progress = st.progress(0, text="Reading scanned PDF with OCR...")
+            
+            for i, img in enumerate(images):
+                ocr_progress.progress((i + 1) / len(images), text=f"Reading page {i+1}/{len(images)} with OCR...")
+                preprocessed_img = preprocess_image_for_ocr(img)
+                page_text = pytesseract.image_to_string(preprocessed_img)
+                page_doc = Document(
+                    page_content=page_text,
+                    metadata={'page': i + 1, 'source_type': 'pdf-ocr'}
+                )
+                all_pages_as_documents.append(page_doc)
+                
+            ocr_progress.empty()
+            st.success("OCR processing complete.")
+        except Exception as e:
+            st.error(f"OCR FAILED. Are Tesseract and Poppler installed in your system's PATH? Error: {e}")
+            if 'ocr_progress' in locals(): ocr_progress.empty()
+            return []
+
+    # --- Step 3: Chunking (Robust settings for statements) ---
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=800)
+    all_chunks = text_splitter.split_documents(all_pages_as_documents)
+
+    if not all_chunks:
+        st.error("Could not extract any text chunks from the PDF.")
+        return []
+        
+    # --- Step 4: AI Extraction ---
+    agent = Agent(
+        name="Statement Parser",
+        model=Ollama(id=OLLAMA_PARSING_MODEL),
+        instructions=["Extract transactions and return only valid JSON array. No markdown, no explanations."],
+        markdown=False,
+    )
+    progress_bar = st.progress(0, text="Parsing PDF...")
+    
+    for i, chunk_doc in enumerate(all_chunks):
+        chunk_text = chunk_doc.page_content
+        page_num = chunk_doc.metadata.get('page', 'N/A')
+        
+        # --- ##### THIS IS THE NEW, SIMPLIFIED PROMPT (Fix 8) ##### ---
+        # This prompt moves the logic from the AI to Python.
+        extraction_prompt = f"""
+You are a meticulous data-entry AI. You only extract; you NEVER invent or hallucinate data.
+
+**YOUR TASK:**
+Find all financial transactions in the text below and format them as a JSON array.
+
+**CRITICAL RULES:**
+1.  **DATE:** Dates are in "DD Mon" format (e.g., "01 Nov"). Assume the year is **2025**. Format the final date as "YYYY-MM-DD".
+    * "01 Nov" -> "2025-11-01"
+2.  **AMOUNTS (THE MOST IMPORTANT RULE):**
+    * You MUST extract the amount and put it in the correct JSON field.
+    * If an amount is in the **"Debit (RM)"** column, you MUST put it in the `"debit_amount"` field.
+    * If an amount is in the **"Credit (RM)"** column, you MUST put it in the `"credit_amount"` field.
+    * **One of these two fields MUST be `null`**. A single transaction cannot be both.
+3.  **HALLUCINATION:** Do not invent transactions. Only extract what you see.
+
+**OUTPUT FORMAT:**
+* Return ONLY a JSON array of objects.
+* Do NOT include any text, explanations, or markdown.
+* Each object in the array MUST have these exact keys:
+    - "date": (string) "YYYY-MM-DD".
+    - "description": (string) The transaction description.
+    - "debit_amount": (float or null) The amount from the "Debit (RM)" column.
+    - "credit_amount": (float or null) The amount from the "Credit (RM)" column.
+    - "category": (string) A simple category (e.g., "Food", "Salary", "Payment").
+4.  If you find NO transactions, return an empty array `[]`.
+
+**EXAMPLE 1 (Debit):**
+Input Text: "01 Nov  Netflix Subscription  28.00  -  4,306.36"
+Output JSON:
+{{
+  "date": "2025-11-01",
+  "description": "Netflix Subscription",
+  "debit_amount": 28.00,
+  "credit_amount": null,
+  "category": "Subscription"
+}}
+
+**EXAMPLE 2 (Credit):**
+Input Text: "02 Nov  Salary - StarTrader Part-Time  -  1,850.00  6,156.36"
+Output JSON:
+{{
+  "date": "2025-11-02",
+  "description": "Salary - StarTrader Part-Time",
+  "debit_amount": null,
+  "credit_amount": 1850.00,
+  "category": "Salary"
+}}
+
+**Bank Statement Text Chunk (Page {page_num}, Chunk {i+1}/{len(all_chunks)}):**
+{chunk_text}
+"""
+        # --- ##### END OF NEW PROMPT ##### ---
+        
+        try:
+            response = agent.run(extraction_prompt).content
+            response = response.strip().replace("```json", "").replace("```", "")
+            
+            start_index = response.find('[')
+            if start_index == -1: continue
+                
+            json_string_slice = response[start_index:]
+            decoder = json.JSONDecoder()
+            page_transactions, _ = decoder.raw_decode(json_string_slice)
+            
+            if page_transactions:
+                for trans in page_transactions:
+                    try:
+                        # Validate that the AI followed instructions
+                        if 'date' not in trans or 'description' not in trans:
+                            st.warning(f"Skipping malformed transaction (missing date/desc): {trans}")
+                            continue
+                        
+                        # --- NEW PYTHON LOGIC TO SET TYPE ---
+                        debit_val = trans.get('debit_amount')
+                        credit_val = trans.get('credit_amount')
+
+                        if debit_val is not None:
+                            trans['type'] = 'expense'
+                            trans['amount'] = abs(float(debit_val))
+                        elif credit_val is not None:
+                            trans['type'] = 'earning'
+                            trans['amount'] = abs(float(credit_val))
+                        else:
+                            st.warning(f"Skipping transaction with no debit/credit amount: {trans.get('description')}")
+                            continue
+                        # --- END NEW PYTHON LOGIC ---
+                        
+                        # Validate the date format
+                        try:
+                            datetime.strptime(trans['date'], '%Y-%m-%d')
+                        except ValueError:
+                            st.warning(f"Skipping transaction with invalid date format: {trans['date']}")
+                            continue
+
+                        trans_date = trans.get('date', 'N/A')
+                        trans_desc = trans.get('description', 'N/A')
+                        
+                        unique_key = f"{trans_date}-{trans_desc}-{trans['amount']}"
+                        
+                        if unique_key not in unique_transactions:
+                            unique_transactions[unique_key] = trans
+                    except Exception as e:
+                        st.warning(f"Skipping one transaction due to parsing error: {e}")
+                            
+        except Exception as e:
+            st.warning(f"Failed to parse chunk {i+1} (Page {page_num}): {e}. Skipping chunk.")
+            continue
+        finally:
+            progress_bar.progress((i + 1) / len(all_chunks), text=f"Parsing page {page_num} (chunk {i+1}/{len(all_chunks)})...")
+
+    progress_bar.empty()
+    return list(unique_transactions.values())
+
+
+# --- CSV Parser (Omitted for brevity) ---
+def parse_bank_statement_csv(uploaded_file):
+    # ... [This function is good, no changes needed] ...
+    try:
+        content = uploaded_file.read().decode('utf-8-sig')
+        csv_reader = csv.DictReader(io.StringIO(content))
+        transactions = []
+        
+        date_cols = ['date', 'Date', 'DATE', 'Transaction Date', 'Posting Date']
+        desc_cols = ['description', 'Description', 'DESC', 'Memo', 'Details']
+        debit_cols = ['Debit', 'Withdrawal', 'debit', 'withdrawal']
+        credit_cols = ['Credit', 'Deposit', 'credit', 'deposit']
+        amount_cols = ['Amount', 'amount', 'AMOUNT'] 
+
+        for row in csv_reader:
+            date_val, desc_val = None, None
+            amount_val, trans_type, category = None, None, None
+
+            for col in date_cols:
+                if col in row and row[col]: date_val = row[col]; break
+            for col in desc_cols:
+                if col in row and row[col]: desc_val = row[col]; break
+            
+            for col in credit_cols:
+                if col in row and row[col]:
+                    try:
+                        amount_val = abs(float(str(row[col]).replace('$', '').replace(',', '')))
+                        if amount_val > 0:
+                            trans_type, category = 'earning', "💰 Deposit"; break
+                    except: pass
+            
+            if not trans_type:
+                for col in debit_cols:
+                    if col in row and row[col]:
+                        try:
+                            amount_val = abs(float(str(row[col]).replace('$', '').replace(',', '').replace('-', '')))
+                            if amount_val > 0:
+                                trans_type, category = 'expense', "💼 Other Expense"; break
+                        except: pass
+            
+            if not trans_type:
+                for col in amount_cols:
+                    if col in row and row[col]:
+                        try:
+                            amount_float = float(str(row[col]).replace('$', '').replace(',', ''))
+                            amount_val = abs(amount_float)
+                            if amount_float > 0:
+                                trans_type, category = 'earning', "💰 Deposit"
+                            elif amount_float < 0:
+                                trans_type, category = 'expense', "💼 Other Expense"
+                            break
+                        except: pass
+
+            
+            if date_val and desc_val and amount_val and trans_type:
+                # Simple Category Guesser
+                desc_lower = desc_val.lower()
+                if trans_type == 'expense':
+                    if any(word in desc_lower for word in ['restaurant', 'food', 'cafe', 'coffee']): category = "🍔 Food & Dining"
+                    elif any(word in desc_lower for word in ['store', 'shop', 'retail', 'amazon']): category = "🛒 Shopping"
+                    elif any(word in desc_lower for word in ['gas', 'fuel', 'uber', 'lyft', 'taxi']): category = "🚗 Transportation"
+                    elif any(word in desc_lower for word in ['rent', 'mortgage', 'housing']): category = "🏠 Housing"
+                    elif any(word in desc_lower for word in ['bill', 'utility', 'internet', 'phone']): category = "💳 Bills & Utilities"
+                else: # Earning categories
+                    if any(word in desc_lower for word in ['salary', 'payroll', 'direct deposit']): category = "💰 Salary"
+                    elif any(word in desc_lower for word in ['refund', 'return']): category = "💸 Refund"
+
+                # Parse date
+                try: parsed_date = datetime.strptime(date_val, '%Y-%m-%d')
+                except:
+                    try: parsed_date = datetime.strptime(date_val, '%m/%d/%Y')
+                    except:
+                        try: parsed_date = datetime.strptime(date_val, '%d/%m/%Y')
+                        except:
+                            try: parsed_date = datetime.fromisoformat(date_val)
+                            except: parsed_date = datetime.now()
+                
+                transactions.append({
+                    'type': trans_type, 'date': parsed_date.isoformat(),
+                    'description': desc_val, 'amount': amount_val, 'category': category
+                })
+        return transactions
+    except Exception as e:
+        st.error(f"Failed to parse CSV: {str(e)}")
+        return []
+
+# --- Transaction Importer (Omitted for brevity) ---
+def import_transactions(transactions):
+    # ... [This function is good, no changes needed] ...
+    expense_count = 0
+    earning_count = 0
+    if not transactions: return 0, 0
+        
+    for trans in transactions:
+        try:
+            trans_type = trans.get('type')
+            date_to_add = None
+            if 'amount' in trans and 'category' in trans and 'description' in trans and 'date' in trans:
+                try:
+                    datetime.fromisoformat(trans['date'])
+                    date_to_add = trans['date']
+                except (ValueError, TypeError):
+                    try: parsed_date = datetime.strptime(trans['date'], '%m/%d/%Y'); date_to_add = parsed_date.isoformat()
+                    except (ValueError, TypeError):
+                        try: parsed_date = datetime.strptime(trans['date'], '%Y-%m-%d'); date_to_add = parsed_date.isoformat()
+                        except (ValueError, TypeError): st.warning(f"Skipped transaction due to unknown date format: {trans.get('date')}"); continue
+                
+                if date_to_add:
+                    amount_to_add = abs(float(trans['amount']))
+                    if trans_type == 'expense':
+                        add_expense(amount_to_add, trans['category'], trans['description'], date_to_add)
+                        expense_count += 1
+                    elif trans_type == 'earning':
+                        add_earning(amount_to_add, trans['category'], trans['description'], date_to_add)
+                        earning_count += 1
+            else:
+                st.warning(f"Skipped transaction due to missing data: {trans}")
+        except Exception as e:
+            st.warning(f"Skipped transaction due to error: {e}")
+            pass
+    return expense_count, earning_count
+
+# --- Chat Management Functions (Omitted for brevity) ---
+def get_all_chats():
+    # ... [This function is good, no changes needed] ...
+    chats = {}
+    if os.path.exists(CHATS_FOLDER):
+        for filename in os.listdir(CHATS_FOLDER):
+            if filename.endswith('.json'):
+                chat_id = filename[:-5]
+                filepath = os.path.join(CHATS_FOLDER, filename)
+                try:
+                    with open(filepath, 'r') as f:
+                        data = json.load(f)
+                        chats[chat_id] = {
+                            'name': data.get('name', 'Untitled Chat'),
+                            'last_updated': data.get('last_updated', '1970-01-01T00:00:00'),
+                            'history': data.get('history', []),
+                            'user_info': data.get('user_info', {}),
+                            'processed_documents': data.get('processed_documents', [])
+                        }
+                except: pass
+    return chats
+
+def save_chat(chat_id, name, history, user_info, processed_documents):
+    # ... [This function is good, no changes needed] ...
+    if not chat_id: return False
+    filepath = os.path.join(CHATS_FOLDER, f"{chat_id}.json")
+    data = {
+        'name': name, 'history': history, 'user_info': user_info,
+        'processed_documents': processed_documents, 'last_updated': datetime.now().isoformat()
+    }
+    try:
+        with open(filepath, 'w') as f: json.dump(data, f, indent=2)
+        return True
+    except Exception as e:
+        st.error(f"Failed to save chat: {e}")
+        return False
+
+def load_chat(chat_id):
+    # ... [This function is good, no changes needed] ...
+    filepath = os.path.join(CHATS_FOLDER, f"{chat_id}.json")
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, 'r') as f: return json.load(f)
+        except Exception as e:
+            st.error(f"Failed to load chat: {e}")
+    return None
+
+def create_new_chat():
+    # ... [This function is good, no changes needed] ...
+    chat_id = str(uuid.uuid4())[:8]
+    name = f"Chat {datetime.now().strftime('%m/%d %H:%M')}"
+    save_chat(chat_id, name, [], {}, [])
+    return chat_id, name
+
+def delete_chat(chat_id):
+    # ... [This function is good, no changes needed] ...
+    filepath = os.path.join(CHATS_FOLDER, f"{chat_id}.json")
+    if os.path.exists(filepath):
+        try:
+            os.remove(filepath)
+            return True
+        except: return False
+    return False
+
+def rename_chat(chat_id, new_name):
+    # ... [This function is good, no changes needed] ...
+    data = load_chat(chat_id)
+    if data:
+        data['name'] = new_name
+        filepath = os.path.join(CHATS_FOLDER, f"{chat_id}.json")
+        try:
+            with open(filepath, 'w') as f: json.dump(data, f, indent=2)
+            return True
+        except: return False
+    return False
+
+# --- Session State Initialization ---
+session_defaults = {
+    "chroma_path": "./chroma_db",
+    "model_version": OLLAMA_REASONING_MODEL, # Uses gemma3:4b
+    "vector_store": None,
+    "processed_documents": [],
+    "history": [],
+    "user_info": {},
+    "rag_enabled": True,
+    "current_chat_id": None,
+    "current_chat_name": "New Chat",
+    "show_expense_tracker": False,
+    "pdf_transactions": None,
+    "csv_transactions": None,
+}
+for key, value in session_defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+# --- Chat Initialization Logic ---
+if st.session_state.current_chat_id is None:
+    all_chats = get_all_chats()
+    if all_chats:
+        latest_chat_id = max(all_chats.keys(), key=lambda k: all_chats[k]['last_updated'])
+        st.session_state.current_chat_id = latest_chat_id
+        chat_data = load_chat(latest_chat_id)
+        if chat_data:
+            st.session_state.current_chat_name = chat_data['name']
+            st.session_state.history = chat_data['history']
+            st.session_state.user_info = chat_data['user_info']
+            st.session_state.processed_documents = chat_data.get('processed_documents', [])
+    else:
+        chat_id, chat_name = create_new_chat()
+        st.session_state.current_chat_id = chat_id
+        st.session_state.current_chat_name = chat_name
+
+
+# --- Sidebar UI (Omitted for brevity) ---
+st.sidebar.markdown("### 💬 Chat Sessions")
+all_chats = get_all_chats()
+# ... [New Chat Button] ...
+if st.sidebar.button("➕ New Chat", use_container_width=True, type="primary"):
+    if st.session_state.current_chat_id:
+        save_chat(
+            st.session_state.current_chat_id, st.session_state.current_chat_name,
+            st.session_state.history, st.session_state.user_info, st.session_state.processed_documents
+        )
+    chat_id, chat_name = create_new_chat()
+    st.session_state.current_chat_id = chat_id
+    st.session_state.current_chat_name = chat_name
+    st.session_state.history = []
+    st.session_state.user_info = {}
+    st.session_state.processed_documents = []
+    st.session_state.show_expense_tracker = False
+    st.rerun()
+
+st.sidebar.markdown("---")
+# ... [Chat List Logic] ...
+for chat_id, chat_data in sorted(all_chats.items(), key=lambda x: x[1]['last_updated'], reverse=True):
+    col1, col2 = st.sidebar.columns([5, 1])
+    with col1:
+        is_active = (chat_id == st.session_state.current_chat_id) and (not st.session_state.show_expense_tracker)
+        button_label = f"{'⚡ ' if is_active else '💭 '}{chat_data['name']}"
+        if st.button(
+            button_label, key=f"chat_{chat_id}", use_container_width=True,
+            type="primary" if is_active else "secondary"
+        ):
+            if st.session_state.current_chat_id != chat_id or st.session_state.show_expense_tracker:
+                save_chat(
+                    st.session_state.current_chat_id, st.session_state.current_chat_name,
+                    st.session_state.history, st.session_state.user_info, st.session_state.processed_documents
+                )
+                loaded_data = load_chat(chat_id)
+                if loaded_data:
+                    st.session_state.current_chat_id = chat_id
+                    st.session_state.current_chat_name = loaded_data['name']
+                    st.session_state.history = loaded_data['history']
+                    st.session_state.user_info = loaded_data['user_info']
+                    st.session_state.processed_documents = loaded_data.get('processed_documents', [])
+                    st.session_state.show_expense_tracker = False
+                    st.rerun()
+    with col2:
+        st.markdown("""<style> ... </style>""", unsafe_allow_html=True) # Omitted for brevity
+        if st.button("🗑️", key=f"del_{chat_id}", type="secondary"):
+            if chat_id != st.session_state.current_chat_id:
+                delete_chat(chat_id)
+                st.rerun()
+            else:
+                st.error("⚠️ Cannot delete active chat")
+# ... [Rest of Sidebar UI] ...
+st.sidebar.markdown("---")
+st.sidebar.markdown("### ✏️ Rename Chat")
+new_name = st.sidebar.text_input("", value=st.session_state.current_chat_name, key="rename_input", label_visibility="collapsed")
+if new_name != st.session_state.current_chat_name:
+    st.session_state.current_chat_name = new_name
+    rename_chat(st.session_state.current_chat_id, new_name)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🤖 AI Chat Model")
+st.session_state.model_version = st.sidebar.text_input(
+    "Model",
+    value=st.session_state.model_version,
+    help=f"Chat model: {OLLAMA_REASONING_MODEL}. Parsing model: {OLLAMA_PARSING_MODEL}.",
+    label_visibility="collapsed"
+)
+st.sidebar.markdown("### 📚 RAG Mode")
+st.session_state.rag_enabled = st.sidebar.toggle(
+    "Enable RAG", value=st.session_state.rag_enabled
+)
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 💰 Finance Tracker")
+is_tracker_active = st.session_state.show_expense_tracker
+if st.sidebar.button("📊 Open Tracker", use_container_width=True, type="primary" if is_tracker_active else "secondary"):
+    st.session_state.show_expense_tracker = True
+    st.rerun()
+
+if not OCR_ENABLED:
+    st.sidebar.error("OCR libraries (`pytesseract`, `pdf2image`, `opencv-python-headless`) not found.")
+    st.sidebar.warning("You must also install Tesseract-OCR and Poppler on your system.")
+else:
+    st.sidebar.info("OCR (Tesseract & Poppler) enabled.")
+
+if st.session_state.user_info.get("mentioned_facts"):
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("📝 Stored Info"):
+        st.sidebar.markdown("**Remembered facts:**")
+        for fact in st.session_state.user_info["mentioned_facts"][-5:]:
+            st.sidebar.markdown(f"• {fact}")
+
+
+# --- Memory Management (Omitted for brevity) ---
+def extract_user_info(conversation):
+    # ... [This function is good, no changes needed] ...
+    user_info = st.session_state.user_info.copy()
+    user_messages = [msg for msg in conversation if msg["role"] == "user"]
+    for msg in user_messages:
+        content = msg["content"]
+        content_lower = content.lower()
+        important_patterns = [
+            "my name is", "i'm", "i am", "my password", "password is",
+            "my email", "i live", "my phone", "remember", "don't forget"
+        ]
+        if any(pattern in content_lower for pattern in important_patterns):
+            user_info["mentioned_facts"] = user_info.get("mentioned_facts", [])
+            if content not in user_info["mentioned_facts"]:
+                user_info["mentioned_facts"].append(content)
+    st.session_state.user_info = user_info
+    return user_info
+
+
+# --- RAG & AI Functions ---
+def init_chroma():
+    """Initializes ChromaDB and ensures the collection exists."""
+    chroma = ChromaDb(
+        collection=COLLECTION_NAME, path=st.session_state.chroma_path,
+        embedder=EMBEDDING_MODEL, persistent_client=True,
+    )
+    try:
+        chroma.client.get_collection(name=COLLECTION_NAME)
+    except Exception:
+        try:
+            chroma.create()
+        except Exception as e:
+            st.error(f"Failed to create Chroma collection: {e}")
+    return chroma
+
+
+def split_texts(documents):
+    """Splits documents into manageable text chunks for RAG."""
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=300)
+    split_docs = text_splitter.split_documents(documents)
+    return [
+        Document(page_content=chunk.page_content, metadata=chunk.metadata)
+        for chunk in split_docs if chunk.page_content.strip()
+    ]
+
+
+# --- Robust RAG PDF Loader ---
+def process_pdf(uploaded_file):
+    """ Extracts text from PDF, with robust OCR fallback (using pre-processing). """
+    tmp_file_path = ""
+    pdf_bytes = uploaded_file.read()
+    uploaded_file.seek(0)
+    documents = []
+    text_content = ""
+    pages = [] 
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(pdf_bytes)
+            tmp_file_path = tmp_file.name
+        loader = PyPDFLoader(tmp_file_path)
+        pages = loader.load() 
+        text_content = "".join([doc.page_content for doc in pages]).strip()
+        
+        # Robust check for scanned PDFs
+        if len(text_content) > 100 * len(pages):
+            documents = pages
+        else:
+            documents = [] 
+            st.warning("Little or no digital text found in general PDF. Attempting OCR...")
+            
+    except Exception as e:
+        st.warning(f"Standard PDF reading failed: {e}. Trying OCR.")
+        text_content = ""
+        documents = []
+    finally:
+        if tmp_file_path and os.path.exists(tmp_file_path):
+            os.unlink(tmp_file_path)
+
+    if not documents: 
+        if not OCR_ENABLED:
+            st.error("Scanned PDF detected, but OCR libraries are not installed.")
+            return []
+        
+        st.info(f"'{uploaded_file.name}' seems to be a scanned document. Attempting OCR...")
+        try:
+            images = convert_from_bytes(pdf_bytes)
+            ocr_text = ""
+            for i, img in enumerate(images):
+                st.spinner(f"Reading page {i+1} with OCR...")
+                preprocessed_img = preprocess_image_for_ocr(img)
+                ocr_text += pytesseract.image_to_string(preprocessed_img)
+                ocr_text += f"\n\n--- OCR Page {i+1} ---\n\n"
+            
+            if not ocr_text.strip():
+                st.error("OCR failed to extract any text.")
+                return []
+            
+            doc_metadata = {"source_type": "pdf-ocr", "file_name": uploaded_file.name}
+            documents = [Document(page_content=ocr_text, metadata=doc_metadata)]
+            st.success("OCR processing complete.")
+        except Exception as e:
+            st.error(f"OCR FAILED. Are Tesseract and Poppler installed? Error: {e}")
+            return []
+            
+    for doc in documents:
+        doc.metadata.update({
+            "source_type": doc.metadata.get("source_type", "pdf-text"),
+            "file_name": uploaded_file.name,
+            "timestamp": datetime.now().isoformat(),
+        })
+    return split_texts(documents)
+
+
+# --- RAG Image Loader ---
+def process_image(uploaded_file):
+    """ Extracts text from an image using OCR (with pre-processing). """
+    if not OCR_ENABLED:
+        st.error("OCR libraries are not installed.")
+        return []
+    try:
+        image_bytes = uploaded_file.read()
+        img = Image.open(io.BytesIO(image_bytes))
+        st.info(f"'{uploaded_file.name}' is an image. Attempting OCR...")
+        
+        preprocessed_img = preprocess_image_for_ocr(img)
+        ocr_text = pytesseract.image_to_string(preprocessed_img)
+        
+        if not ocr_text.strip():
+            st.warning("OCR failed to extract any text from the image.")
+            return []
+            
+        st.success("Image OCR processing complete.")
+        doc_metadata = {
+            "source_type": "image-ocr", "file_name": uploaded_file.name,
+            "timestamp": datetime.now().isoformat(),
+        }
+        documents = [Document(page_content=ocr_text, metadata=doc_metadata)]
+        return split_texts(documents)
+    except Exception as e:
+        st.error(f"Image OCR FAILED. Is Tesseract installed? Error: {e}")
+        return []
+
+
+# --- RAG Question Generator (Anti-Hallucination) ---
+def generate_followup_questions(text):
+    """ Generates follow-up questions using the powerful parsing model. """
+    
+    if not text or len(text.strip()) < 50:
+        return "Could not generate questions. The document appears to be empty or unreadable."
+
+    # --- Stricter Anti-Hallucination Prompt ---
+    followup_prompt = f"""
+You are an AI assistant. You will be given a piece of text. Your **ONLY** task is to generate 5 relevant questions that can be answered *using the provided text*.
+
+**CRITICAL INSTRUCTIONS:**
+1.  Read the text. **If the text is about bank transactions, ask questions about dates, amounts, or descriptions.**
+2.  **If the text is garbled, unreadable, or just random metadata, you MUST respond with *only* this exact string: "Could not generate relevant questions from this document."**
+3.  **DO NOT** make up questions about random topics like biology or history. The questions MUST be from the text.
+4.  Output ONLY the 5 questions in a numbered list.
+5.  **DO NOT** say "Okay, here are..." or any other conversational intro.
+
+**TEXT:**
+{text}
+"""
+    
+    followup_agent = Agent(
+        name="Follow-up Question Agent",
+        model=Ollama(id=OLLAMA_PARSING_MODEL),
+        instructions=["Only output 5 numbered questions based *strictly* on the provided text, or a single error message."],
+        markdown=True,
+    )
+    try:
+        questions = followup_agent.run(followup_prompt).content
+        if "1." in questions:
+             questions = questions[questions.find("1."):]
+        return questions
+    except Exception as e:
+        return f"Could not generate questions: {e}"
+
+# --- Other AI Helpers (Omitted for brevity) ---
+def filter_think_tags(response):
+    return re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL)
+
+def build_conversation_context():
+    if not st.session_state.history: return ""
+    context = "Full conversation history:\n"
+    for msg in st.session_state.history:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        context += f"{role}: {msg['content']}\n"
+    return context + "\n"
+
+def build_user_info_context():
+    if not st.session_state.user_info.get("mentioned_facts"): return ""
+    context = "IMPORTANT - User has told you these facts (remember them):\n"
+    for fact in st.session_state.user_info["mentioned_facts"]:
+        context += f"- {fact}\n"
+    return context + "\n"
+
+def get_conversational_agent():
+    """ Gets the main chat agent, now using the 4b model. """
+    return Agent(
+        name="Conversational RAG Agent",
+        model=Ollama(id=st.session_state.model_version), # This is gemma3:4b
+        instructions=[
+            "You are a helpful AI assistant.",
+            "Be direct and concise - answer the question without extra elaboration.",
+            "CRITICAL: Remember ALL information the user tells you.",
+            "If document context is provided, you **MUST** base your answer on it.",
+            "If the answer is not in the document context, state that clearly.",
+            "Always check conversation history before saying you don't know something."
+        ],
+        markdown=True,
+    )
+
+def retrieve_documents(prompt, vector_store_client, COLLECTION_NAME):
+    """Retrieve relevant documents from ChromaDB."""
+    try:
+        if hasattr(vector_store_client, 'client'):
+             client = vector_store_client.client
+        else:
+             client = vector_store_client
+             
+        vector_store = client.get_collection(name=COLLECTION_NAME)
+        results = vector_store.query(query_texts=[prompt], n_results=5)
+        docs = results.get("documents", [[]])[0]
+        has_docs = len(docs) > 0
+        return docs, has_docs
+    except Exception as e:
+        st.error(f"Error retrieving documents: {e}")
+        return [], False
+
+
+# --- ##### FULLY RESTORED EXPENSE TRACKER UI ##### ---
+if st.session_state.show_expense_tracker:
+    
+    st.markdown("---")
+    st.markdown("<h2 style='text-align: center;'>💰 Finance Tracker</h2>", unsafe_allow_html=True)
+    
+    tabs = st.tabs(["📊 Overview", "➕ Add Transaction", "📤 Import Statement", "📋 History", "📈 Analytics", "🗓️ Calendar View"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = tabs[0], tabs[1], tabs[2], tabs[3], tabs[4], tabs[5]
+    
+    # --- TAB 1: OVERVIEW (Restored) ---
+    with tab1:
+        st.markdown("### 🗓️ Current Period Summary")
+        
+        st.info("""
+        This tab shows data for the **current period only** (Today, This Week, This Month).
+        Imported data from previous months will appear in the **Analytics** and **History** tabs.
+        """)
+        
+        daily_expenses = get_transactions_by_period(load_expenses, 'daily')
+        weekly_expenses = get_transactions_by_period(load_expenses, 'weekly')
+        monthly_expenses = get_transactions_by_period(load_expenses, 'monthly')
+        daily_earnings = get_transactions_by_period(load_earnings, 'daily')
+        weekly_earnings = get_transactions_by_period(load_earnings, 'weekly')
+        monthly_earnings = get_transactions_by_period(load_earnings, 'monthly')
+
+        daily_total_exp = calculate_total(daily_expenses)
+        weekly_total_exp = calculate_total(weekly_expenses)
+        monthly_total_exp = calculate_total(monthly_expenses)
+        daily_total_earn = calculate_total(daily_earnings)
+        weekly_total_earn = calculate_total(weekly_earnings)
+        monthly_total_earn = calculate_total(monthly_earnings)
+        
+        daily_net = daily_total_earn - daily_total_exp
+        weekly_net = weekly_total_earn - weekly_total_exp
+        monthly_net = monthly_total_earn - monthly_total_exp
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Today's Net", f"${daily_net:.2f}")
+            st.metric("Today's Earnings", f"${daily_total_earn:.2f}", delta_color="off")
+            st.metric("Today's Expenses", f"${daily_total_exp:.2f}", delta_color="off")
+        with col2:
+            st.metric("This Week's Net", f"${weekly_net:.2f}")
+            st.metric("This Week's Earnings", f"${weekly_total_earn:.2f}", delta_color="off")
+            st.metric("This Week's Expenses", f"${weekly_total_exp:.2f}", delta_color="off")
+        with col3:
+            st.metric("This Month's Net", f"${monthly_net:.2f}")
+            st.metric("This Month's Earnings", f"${monthly_total_earn:.2f}", delta_color="off")
+            st.metric("This Month's Expenses", f"${monthly_total_exp:.2f}", delta_color="off")
+            
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        st.markdown("### 📅 Daily Spending This Week")
+        week_days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        daily_totals = {day: 0 for day in week_days}
+        
+        for expense in weekly_expenses:
+            try:
+                expense_date = datetime.fromisoformat(expense['date'])
+                day_name = expense_date.strftime('%a')
+                if day_name in daily_totals:
+                    daily_totals[day_name] += expense.get('amount', 0)
+            except:
+                continue
+                
+        fig_week_daily = go.Figure(data=[go.Bar(
+            x=week_days,
+            y=[daily_totals[day] for day in week_days],
+            text=[f'${daily_totals[day]:.2f}' for day in week_days],
+            textposition='auto',
+            marker_color='#dc3545'
+        )])
+        fig_week_daily.update_layout(
+            yaxis_title='Amount ($)',
+            height=350,
+            margin=dict(t=20, b=20, l=20, r=20),
+        )
+        st.plotly_chart(fig_week_daily, use_container_width=True, theme="streamlit")
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        st.markdown("### 📊 Monthly Expense Categories")
+        category_data = get_expenses_by_category()
+        
+        if category_data:
+            monthly_categories = {}
+            for category, expenses in category_data.items():
+                monthly_cat_expenses = [e for e in expenses if e in monthly_expenses]
+                if monthly_cat_expenses:
+                    monthly_categories[category] = calculate_total(monthly_cat_expenses)
+            
+            if monthly_categories:
+                chart_col1, chart_col2 = st.columns(2)
+                
+                with chart_col1:
+                    st.markdown("**Category Distribution**")
+                    fig = go.Figure(data=[go.Pie(
+                        labels=list(monthly_categories.keys()),
+                        values=[abs(v) for v in monthly_categories.values()],
+                        hole=0.4,
+                        marker=dict(colors=['#6c757d', '#28a745', '#17a2b8', '#ffc107', '#dc3545', '#6f42c1', '#fd7e14', '#20c997', '#e83e8c', '#6610f2']),
+                    )])
+                    fig.update_layout(showlegend=True, height=350, margin=dict(t=20, b=20, l=20, r=20))
+                    st.plotly_chart(fig, use_container_width=True, theme="streamlit")
+                
+                with chart_col2:
+                    st.markdown("**Spending by Category**")
+                    sorted_categories = sorted(monthly_categories.items(), key=lambda x: x[1])
+                    fig = go.Figure(data=[go.Bar(
+                        x=[abs(val) for cat, val in sorted_categories],
+                        y=[cat for cat, val in sorted_categories],
+                        orientation='h',
+                        marker=dict(color='#6c757d'),
+                    )])
+                    fig.update_layout(height=350, margin=dict(t=20, b=20, l=20, r=20), xaxis=dict(title='Amount ($)'))
+                    st.plotly_chart(fig, use_container_width=True, theme="streamlit")
+            else:
+                st.info("No expenses recorded this month.")
+        else:
+            st.info("No expenses recorded yet.")
+    
+    # --- TAB 2: ADD TRANSACTION (Restored) ---
+    with tab2:
+        st.markdown("### ➕ Add New Transaction")
+        
+        trans_type = st.radio("Transaction Type", ["Expense", "Earning"], horizontal=True)
+        
+        if trans_type == "Expense":
+            with st.form("add_expense_form"):
+                st.markdown("#### Add Expense")
+                amount = st.number_input("Amount ($)", min_value=0.01, step=0.01, format="%.2f")
+                category = st.selectbox("Category", [
+                    "🍔 Food & Dining", "🛒 Shopping", "🚗 Transportation", "🏠 Housing",  
+                    "💊 Healthcare", "🎬 Entertainment", "💳 Bills & Utilities",  
+                    "✈️ Travel", "🎓 Education", "💼 Other Expense"
+                ])
+                description = st.text_input("Description")
+                expense_date = st.date_input("Date", value=datetime.now())
+                
+                submitted = st.form_submit_button("Add Expense", use_container_width=True)
+                
+                if submitted and amount > 0:
+                    expense_datetime = datetime.combine(expense_date, datetime.min.time())
+                    add_expense(amount, category, description, expense_datetime.isoformat())
+                    st.success(f"✅ Added Expense: ${amount:.2f}")
+                    st.rerun()
+        
+        elif trans_type == "Earning":
+            with st.form("add_earning_form"):
+                st.markdown("#### Add Earning")
+                amount = st.number_input("Amount ($)", min_value=0.01, step=0.01, format="%.2f")
+                category = st.selectbox("Category", ["💰 Salary", "💰 Deposit", "💸 Refund", "💰 Other Earning"])
+                description = st.text_input("Description")
+                earning_date = st.date_input("Date", value=datetime.now())
+                
+                submitted = st.form_submit_button("Add Earning", use_container_width=True)
+                
+                if submitted and amount > 0:
+                    earning_datetime = datetime.combine(earning_date, datetime.min.time())
+                    add_earning(amount, category, description, earning_datetime.isoformat())
+                    st.success(f"✅ Added Earning: ${amount:.2f}")
+                    st.rerun()
+    
+    # --- TAB 3: IMPORT STATEMENT (Restored) ---
+    with tab3:
+        st.markdown("### 📤 Import Bank Statement")
+        
+        st.info("💡 Upload your bank statement in PDF or CSV format. The AI will automatically extract earnings and expenses.")
+        
+        upload_col1, upload_col2 = st.columns(2)
+        
+        with upload_col1:
+            st.markdown("#### 📄 PDF Statement")
+            pdf_file = st.file_uploader("Upload PDF", type=["pdf"], key="pdf_upload")
+            
+            if st.button("🔍 Parse PDF Statement", use_container_width=True, disabled=not pdf_file):
+                st.session_state.csv_transactions = None # Clear other state
+                with st.spinner(f"Analyzing bank statement with {OLLAMA_PARSING_MODEL}... This may take a moment for long or scanned documents."):
+                    st.session_state.pdf_transactions = parse_bank_statement_pdf(pdf_file)
+                st.rerun() # Rerun to show preview and import button
+                
+            if st.session_state.pdf_transactions:
+                transactions = st.session_state.pdf_transactions
+                st.success(f"✅ Found {len(transactions)} transactions!")
+                
+                st.markdown("**Preview:**")
+                for trans in transactions[:5]:
+                    type_emoji = "🟢" if trans.get('type') == 'earning' else "🔴"
+                    st.markdown(f"{type_emoji} {trans.get('date', 'N/A')}: {trans.get('description', 'N/A')} - ${trans.get('amount', 0):.2f}")
+                
+                if len(transactions) > 5: st.markdown(f"... and {len(transactions) - 5} more")
+                
+                if st.button("✅ Import All Transactions", use_container_width=True, key="import_pdf"):
+                    exp_count, earn_count = import_transactions(st.session_state.pdf_transactions)
+                    st.success(f"🎉 Imported {exp_count} expenses and {earn_count} earnings!")
+                    st.info("Note: The 'Overview' tab only shows data for the current period. 'History' and 'Analytics' will show all imported data.")
+                    st.session_state.pdf_transactions = None # Clear state
+                    st.rerun()
+        
+        with upload_col2:
+            st.markdown("#### 📊 CSV Statement")
+            csv_file = st.file_uploader("Upload CSV", type=["csv"], key="csv_upload")
+            
+            if st.button("🔍 Parse CSV Statement", use_container_width=True, disabled=not csv_file):
+                st.session_state.pdf_transactions = None # Clear other state
+                with st.spinner("Processing CSV file..."):
+                    st.session_state.csv_transactions = parse_bank_statement_csv(csv_file)
+                st.rerun()  
+
+            if st.session_state.csv_transactions:
+                transactions = st.session_state.csv_transactions
+                st.success(f"✅ Found {len(transactions)} transactions!")
+                
+                st.markdown("**Preview:**")
+                for trans in transactions[:5]:
+                    type_emoji = "🟢" if trans.get('type') == 'earning' else "🔴"
+                    st.markdown(f"{type_emoji} {trans.get('date', 'N/A')}: {trans.get('description', 'N/A')} - ${trans.get('amount', 0):.2f}")
+                
+                if len(transactions) > 5: st.markdown(f"... and {len(transactions) - 5} more")
+                
+                if st.button("✅ Import All Transactions", use_container_width=True, key="import_csv"):
+                    exp_count, earn_count = import_transactions(st.session_state.csv_transactions)
+                    st.success(f"🎉 Imported {exp_count} expenses and {earn_count} earnings!")
+                    st.info("Note: The 'Overview' tab only shows data for the current period. 'History' and 'Analytics' will show all imported data.")
+                    st.session_state.csv_transactions = None # Clear state
+                    st.rerun()
+                
+        st.markdown("---")
+        st.markdown("### 📝 CSV Format Guide")
+        st.markdown("""
+        Your CSV should have columns like:
+        - **Date** (or Transaction Date)
+        - **Description** (or Memo)
+        - **Debit** (or Withdrawal) for expenses
+        - **Credit** (or Deposit) for earnings
+        
+        *If you only have one 'Amount' column, the app will try to guess (e.g., negative numbers are expenses).*
+        """)
+    
+    # --- TAB 4: HISTORY (Restored) ---
+    with tab4:
+        st.markdown("### 📋 Transaction History")
+        
+        filter_type = st.radio("Show", ["All Transactions", "Expenses Only", "Earnings Only"], horizontal=True)
+        
+        expenses = load_expenses()
+        earnings = load_earnings()
+        
+        if filter_type == "Expenses Only":
+            all_transactions = expenses
+        elif filter_type == "Earnings Only":
+            all_transactions = earnings
+        else:
+            all_transactions = expenses + earnings
+
+        if all_transactions:
+            transactions_sorted = sorted(all_transactions, key=lambda x: x.get('date', '1970-01-01'), reverse=True)
+            
+            for trans in transactions_sorted:
+                try:
+                    trans_date = datetime.fromisoformat(trans['date'])
+                    date_str = trans_date.strftime('%Y-%m-%d')
+                except:
+                    date_str = "Invalid Date"
+                
+                is_earning = trans.get('type') == 'earning'
+                amount_color = "#28a745" if is_earning else "#dc3545" # Green for earning, Red for expense
+                amount_sign = "+" if is_earning else "-"
+
+                col1, col2, col3 = st.columns([3, 2, 1])
+                
+                with col1:
+                    st.markdown(f"""
+                        <div style='background: #ffffff; padding: 15px; border-radius: 8px; border: 1px solid #e9ecef; margin: 5px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.05);'>
+                            <strong style='color: {amount_color};'>{trans.get('category', 'N/A')}</strong><br>
+                            <span style='color: #6c757d;'>{trans.get('description', 'N/A')}</span><br>
+                            <small style='color: #adb5bd;'>{date_str}</small>
+                        </div>
+                    """, unsafe_allow_html=True)
+                
+                with col2:
+                    st.markdown(f"""
+                        <div style='background: #ffffff; padding: 15px; border-radius: 8px; border: 1px solid {amount_color}; margin: 5px 0; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05);'>
+                            <h3 style='color: {amount_color}; margin: 0; font-size: 24px;'>{amount_sign}${trans.get('amount', 0):.2f}</h3>
+                        </div>
+                    """, unsafe_allow_html=True)
+                
+                with col3:
+                    delete_func = delete_earning if is_earning else delete_expense
+                    st.button("🗑️", key=f"del_hist_{trans['id']}", on_click=delete_func, args=(trans['id'],))
+        else:
+            st.info("No transactions found for this filter.")
+
+    # --- TAB 5: ANALYTICS (Restored) ---
+    with tab5:
+        st.markdown("### 📈 Analytics")
+        
+        all_expenses = load_expenses()
+        all_earnings = load_earnings()
+        
+        if not all_expenses and not all_earnings:
+            st.info("No data available for analytics. Add some transactions first.")
+        else:
+            now = datetime.now()
+            
+            # --- Earnings vs Expenses This Year ---
+            st.markdown("### 🗓️ Earnings vs. Expenses (This Year)")
+            month_names = [datetime(now.year, m, 1).strftime('%b') for m in range(1, 13)]
+            monthly_expense_totals = {month: 0 for month in month_names}
+            monthly_earning_totals = {month: 0 for month in month_names}
+
+            for expense in all_expenses:
+                try:
+                    expense_date = datetime.fromisoformat(expense['date'])
+                    if expense_date.year == now.year:
+                        month_name = expense_date.strftime('%b')
+                        monthly_expense_totals[month_name] += abs(expense.get('amount', 0))
+                except: continue
+                
+            for earning in all_earnings:
+                try:
+                    earning_date = datetime.fromisoformat(earning['date'])
+                    if earning_date.year == now.year:
+                        month_name = earning_date.strftime('%b')
+                        monthly_earning_totals[month_name] += abs(earning.get('amount', 0))
+                except: continue
+
+            fig_ee_bar = go.Figure(data=[
+                go.Bar(name='Earnings', x=month_names, y=[monthly_earning_totals[m] for m in month_names], marker_color='#28a745'),
+                go.Bar(name='Expenses', x=month_names, y=[monthly_expense_totals[m] for m in month_names], marker_color='#dc3545')
+            ])
+            fig_ee_bar.update_layout(barmode='group', yaxis_title='Amount ($)', height=350, margin=dict(t=20, b=20, l=20, r=20))
+            st.plotly_chart(fig_ee_bar, use_container_width=True, theme="streamlit")
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            # --- All-Time Stats ---
+            st.markdown("### 📊 All-Time Analytics")
+            total_all_time_exp = calculate_total(all_expenses)
+            total_all_time_earn = calculate_total(all_earnings)
+            total_net = total_all_time_earn - total_all_time_exp
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total Earnings", f"${total_all_time_earn:.2f}")
+            col2.metric("Total Expenses", f"${total_all_time_exp:.2f}")
+            col3.metric("Net Cashflow", f"${total_net:.2f}")
+            
+            st.markdown("<br>", unsafe_allow_html=True)
+            
+            # --- Expense Category Charts ---
+            st.markdown("### Expense Categories (All Time)")
+            chart_col1, chart_col2 = st.columns(2)
+            
+            category_totals = {}
+            for expense in all_expenses:
+                cat = expense.get('category', '💼 Other')
+                category_totals[cat] = category_totals.get(cat, 0) + abs(expense.get('amount', 0))
+
+            if category_totals:
+                with chart_col1:
+                    st.markdown("### Category Distribution")
+                    fig_pie = go.Figure(data=[go.Pie(
+                        labels=list(category_totals.keys()),
+                        values=list(category_totals.values()),
+                        hole=0.4,
+                        marker=dict(colors=['#6c757d', '#28a745', '#17a2b8', '#ffc107', '#dc3545', '#6f42c1', '#fd7e14', '#20c997', '#e83e8c', '#6610f2']),
+                    )])
+                    fig_pie.update_layout(showlegend=True, height=400, margin=dict(t=20, b=20, l=20, r=20))
+                    st.plotly_chart(fig_pie, use_container_width=True, theme="streamlit")
+                
+                with chart_col2:
+                    st.markdown("### Top Spending Categories")
+                    sorted_categories = sorted(category_totals.items(), key=lambda x: x[1], reverse=True)
+                    fig_bar = go.Figure(data=[go.Bar(
+                        x=[cat[0] for cat in sorted_categories],
+                        y=[cat[1] for cat in sorted_categories],
+                        marker=dict(color='#6c757d'),
+                    )])
+                    # --- THIS IS THE TYPO FIX ---
+                    fig_bar.update_layout(height=400, margin=dict(t=20, b=20, l=20, r=20), xaxis=dict(tickangle=-45), yaxis=dict(title='Amount ($)'))
+                    st.plotly_chart(fig_bar, use_container_width=True, theme="streamlit")
+            else:
+                st.info("No expense data to analyze.")
+    
+    # --- TAB 6: CALENDAR VIEW (Restored) ---
+    with tab6:
+        st.markdown("### 🗓️ Calendar View")
+        
+        selected_date = st.date_input("Select a date to see transactions", value=datetime.now())
+        
+        all_expenses = load_expenses()
+        all_earnings = load_earnings()
+        
+        day_expenses = []
+        for expense in all_expenses:
+            try:
+                if datetime.fromisoformat(expense.get('date')).date() == selected_date:
+                    day_expenses.append(expense)
+            except: continue
+            
+        day_earnings = []
+        for earning in all_earnings:
+            try:
+                if datetime.fromisoformat(earning.get('date')).date() == selected_date:
+                    day_earnings.append(earning)
+            except: continue
+        
+        day_total_exp = calculate_total(day_expenses)
+        day_total_earn = calculate_total(day_earnings)
+        day_net = day_total_earn - day_total_exp
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric(f"Net for {selected_date.strftime('%b %d')}", f"${day_net:.2f}")
+        col2.metric(f"Earnings", f"${day_total_earn:.2f}", f"{len(day_earnings)} transactions")
+        col3.metric(f"Expenses", f"${day_total_exp:.2f}", f"{len(day_expenses)} transactions", delta_color="inverse")
+
+        st.markdown("---")
+        
+        all_day_transactions = sorted(day_earnings + day_expenses, key=lambda x: x.get('timestamp', '00:00'), reverse=True)
+        
+        if all_day_transactions:
+            for trans in all_day_transactions:
+                is_earning = trans.get('type') == 'earning'
+                amount_color = "#28a745" if is_earning else "#dc3545"
+                amount_sign = "+" if is_earning else "-"
+                
+                col1, col2, col3 = st.columns([3, 2, 1])
+                with col1:
+                    st.markdown(f"""
+                        <div style='background: #ffffff; padding: 15px; border-radius: 8px; border: 1px solid #e9ecef; margin: 5px 0; box-shadow: 0 1px 3px rgba(0,0,0,0.05);'>
+                            <strong style='color: {amount_color};'>{trans.get('category', 'N/A')}</strong><br>
+                            <span style='color: #6c757d;'>{trans.get('description', 'N/A')}</span>
+                        </div>
+                    """, unsafe_allow_html=True)
+                with col2:
+                    st.markdown(f"""
+                        <div style='background: #ffffff; padding: 15px; border-radius: 8px; border: 1px solid {amount_color}; margin: 5px 0; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.05);'>
+                            <h3 style='color: {amount_color}; margin: 0; font-size: 24px;'>{amount_sign}${trans.get('amount', 0):.2f}</h3>
+                        </div>
+                    """, unsafe_allow_html=True)
+                with col3:
+                    delete_func = delete_earning if is_earning else delete_expense
+                    st.button("🗑️", key=f"del_cal_{trans['id']}", on_click=delete_func, args=(trans['id'],))
+        else:
+            st.info("No transactions recorded for this day.")
+            
+    st.markdown("---")
+
+
+# --- File Upload & RAG Logic (Sidebar) ---
+chroma_client = None  
+if st.session_state.rag_enabled:
+    try:
+        chroma_client = init_chroma()
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("### 📁 Upload PDFs & Images")
+        uploaded_files = st.sidebar.file_uploader(
+            "", type=["pdf", "png", "jpg", "jpeg"],  
+            accept_multiple_files=True, label_visibility="collapsed"
+        )
+
+        if uploaded_files:
+            files_to_process = [f for f in uploaded_files if f.name not in st.session_state.processed_documents]
+            
+            if files_to_process:
+                for uploaded_file in files_to_process:
+                    data = []
+                    file_extension = os.path.splitext(uploaded_file.name)[1].lower()
+                    
+                    with st.spinner(f"Processing '{uploaded_file.name}'..."):
+                        if file_extension == ".pdf":
+                            data = process_pdf(uploaded_file) # Uses new, robust logic
+                        elif file_extension in [".png", ".jpg", ".jpeg"]:
+                            data = process_image(uploaded_file)
+                        else:
+                            st.warning(f"Unsupported file type: {uploaded_file.name}")
+                            continue
+                            
+                        if data:
+                            document_text = " ".join([doc.page_content for doc in data])
+                            if document_text.strip():
+                                with st.spinner(f"Generating questions with {OLLAMA_PARSING_MODEL}..."):
+                                    ids = [f"{uploaded_file.name}_{i}" for i in range(len(data))]
+                                    texts = [doc.page_content for doc in data]
+                                    metadatas = [doc.metadata for doc in data]
+
+                                    collection = chroma_client.client.get_collection(name=COLLECTION_NAME)
+                                    collection.add(ids=ids, documents=texts, metadatas=metadatas)
+
+                                    follow_up_questions = generate_followup_questions(document_text) # Uses new, strict prompt
+
+                                    st.session_state.history.append({
+                                        "role": "assistant",
+                                        "content": f"✅ **Processing Complete: '{uploaded_file.name}'**\n\n🎯 Suggested Questions:\n\n{follow_up_questions}",
+                                    })
+                            else:
+                                st.session_state.history.append({
+                                    "role": "assistant",
+                                    "content": f"⚠️ **Processing Failed: '{uploaded_file.name}'**\n\nThe document appears to be empty or unreadable. No text was extracted.",
+                                })
+                            st.session_state.processed_documents.append(uploaded_file.name)
+                
+                save_chat(
+                    st.session_state.current_chat_id, st.session_state.current_chat_name,
+                    st.session_state.history, st.session_state.user_info, st.session_state.processed_documents
+                )
+                st.rerun()
+    except Exception as e:
+        st.sidebar.error(f"RAG Error: {e}")
+        st.session_state.rag_enabled = False
+
+
+# --- Chat UI (Main Window) ---
+if not st.session_state.show_expense_tracker:
+    
+    for message in st.session_state.history:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+
+    prompt = st.chat_input("Ask me anything...")
+
+    if prompt:
+        st.session_state.history.append({"role": "user", "content": prompt})
+        st.chat_message("user").write(prompt)
+
+        extract_user_info(st.session_state.history)
+
+        conversation_context = build_conversation_context()
+        user_info_context = build_user_info_context()
+        
+        document_context = ""
+        if st.session_state.rag_enabled and chroma_client:
+            with st.spinner("Searching documents..."):
+                docs, has_docs = retrieve_documents(prompt, chroma_client, COLLECTION_NAME)
+                if has_docs:
+                    document_context = "\n\nRelevant documents:\n" + "\n\n".join(docs) + "\n"
+
+        with st.spinner("Thinking..."):
+            agent = get_conversational_agent()
+            
+            if document_context:
+                full_prompt = f"""{user_info_context}
+{conversation_context}
+{document_context}
+
+**Current question: {prompt}**
+
+**Instruction:** Answer the user's question. You **MUST** use the 'Relevant documents' context provided above. Answer based *only* on this context. If the answer is not in the context, state that clearly.
+"""
+            else:
+                full_prompt = f"""{user_info_context}
+{conversation_context}
+
+**Current question: {prompt}**
+
+**Instruction:** Answer directly and concisely. Remember to check the conversation history and stored facts above.
+"""
+            
+            try:
+                response = agent.run(full_prompt).content
+                clean_response = filter_think_tags(response)
+            except Exception as e:
+                clean_response = f"Sorry, I ran into an error: {e}"
+                st.error(clean_response)
+
+            st.session_state.history.append(
+                {"role": "assistant", "content": clean_response}
+            )
+            st.chat_message("assistant").write(clean_response)
+            
+            save_chat(
+                st.session_state.current_chat_id, st.session_state.current_chat_name,
+                st.session_state.history, st.session_state.user_info, st.session_state.processed_documents
+            )
